@@ -1,0 +1,39 @@
+{
+  "broad-catch": {
+    "pr_url": "https://github.com/jjejones31/superset/pull/62",
+    "issue_number": 15,
+    "finding_id": "f_e4e396bf12",
+    "summary": "Narrowed `except Exception` in `Database.has_view()` L1253 to `except (DBAPIError, NotImplementedError)`. Traced single call path, used SQLAlchemy base exception class, added 3 unit tests for propagation/catch behavior.",
+    "key_learnings": [
+      "Use SQLAlchemy base exception (DBAPIError) rather than individual subclasses",
+      "Always add a test for unexpected error propagation",
+      "Check dialect implementations to enumerate possible exceptions",
+      "File tests in tests/unit_tests/models/core_test.py"
+    ]
+  },
+  "describe-to-test": {
+    "pr_url": "https://github.com/jjejones31/superset/pull/63",
+    "issue_number": 60,
+    "finding_id": "f_701d26fa02",
+    "summary": "Migrated AdhocFilter.test.ts: removed describe() wrapper + eslint-disable comment, prefixed test names with component name, dedented to flat. All 14 tests preserved.",
+    "key_learnings": [
+      "Prefix test names with component/module name for traceability",
+      "Remove the eslint-disable-next-line comment (it's the migration marker)",
+      "If beforeEach exists, inline setup into each test or extract to helper",
+      "Run npx jest <file> --verbose to verify same test count"
+    ]
+  },
+  "any-type": {
+    "pr_url": "https://github.com/jjejones31/superset/pull/64",
+    "issue_number": 45,
+    "finding_id": "f_0484d91daa",
+    "summary": "Eliminated 7 `any` types in SavedQueryList/index.tsx. Used CellProps<D> from react-table, typed useSelector callback, extended shared type locally for API fields.",
+    "key_learnings": [
+      "Use CellProps<D> from react-table for Cell renderers (very common in list pages)",
+      "Type useSelector with actual Redux store shape",
+      "Extend shared types locally when API returns extra fields",
+      "Remove annotations where TypeScript inference suffices",
+      "Look for existing types in @superset-ui/core, @superset-ui/chart-controls, src/types/"
+    ]
+  }
+}
