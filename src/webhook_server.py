@@ -599,9 +599,8 @@ def dispatch():
     })
 
 
-@app.route("/dashboard", methods=["GET"])
-def dashboard():
-    """JSON dashboard with full observability data."""
+def _get_dashboard_data() -> dict:
+    """Shared data builder for all dashboard views."""
     state = DispatchState.load()
     monitor = MonitorState.load()
 
@@ -610,7 +609,6 @@ def dashboard():
     success = sum(1 for e in state.dispatched.values() if e.get("outcome") == "success")
     failed = sum(1 for e in state.dispatched.values() if e.get("outcome") == "failed")
 
-    # Per-class breakdown
     by_class: dict[str, dict] = {}
     for fid, entry in state.dispatched.items():
         cls = entry.get("remediation_class", "unknown")
@@ -624,7 +622,6 @@ def dashboard():
         if entry.get("outcome") == "failed":
             by_class[cls]["failed"] += 1
 
-    # Stuck sessions
     stuck = [
         {"finding_id": fid, "session_id": tl.session_id,
          "class": tl.remediation_class, "dispatched_at": tl.dispatched_at}
@@ -632,13 +629,180 @@ def dashboard():
         if tl.is_stuck
     ]
 
-    return jsonify({
+    sessions = []
+    for fid, entry in state.dispatched.items():
+        sessions.append({
+            "finding_id": fid,
+            "issue_number": entry.get("issue_number", ""),
+            "remediation_class": entry.get("remediation_class", ""),
+            "status": entry.get("status", ""),
+            "outcome": entry.get("outcome", ""),
+            "pr_url": entry.get("pr_url", ""),
+            "dispatched_at": entry.get("dispatched_at", ""),
+        })
+
+    return {
         "summary": {"total": total, "running": running, "success": success, "failed": failed},
         "by_class": by_class,
         "stuck_sessions": stuck,
+        "sessions": sessions,
         "reference_prs": list(REFERENCE_PRS.keys()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    """HTML observability dashboard."""
+    data = _get_dashboard_data()
+    s = data["summary"]
+    success_rate = round(s["success"] / s["total"] * 100) if s["total"] else 0
+
+    class_rows = ""
+    for cls, info in sorted(data["by_class"].items()):
+        rate = round(info["success"] / info["total"] * 100) if info["total"] else 0
+        bar_w = rate
+        class_rows += f"""
+        <tr>
+          <td><span class="badge badge-{cls}">{cls}</span></td>
+          <td>{info['total']}</td>
+          <td class="success">{info['success']}</td>
+          <td class="running">{info['running']}</td>
+          <td class="failed">{info['failed']}</td>
+          <td>
+            <div class="bar-bg"><div class="bar-fill" style="width:{bar_w}%"></div></div>
+            <span class="rate">{rate}%</span>
+          </td>
+        </tr>"""
+
+    session_rows = ""
+    for sess in data["sessions"]:
+        outcome = sess["outcome"] or sess["status"]
+        outcome_cls = "success" if outcome == "success" else ("failed" if outcome == "failed" else "running")
+        pr_link = f'<a href="{sess["pr_url"]}" target="_blank">PR</a>' if sess["pr_url"] else "--"
+        issue_link = f'<a href="https://github.com/jjejones31/superset/issues/{sess["issue_number"]}" target="_blank">#{sess["issue_number"]}</a>'
+        session_rows += f"""
+        <tr>
+          <td>{issue_link}</td>
+          <td><span class="badge badge-{sess['remediation_class']}">{sess['remediation_class']}</span></td>
+          <td><code>{sess['finding_id']}</code></td>
+          <td class="{outcome_cls}">{outcome}</td>
+          <td>{pr_link}</td>
+        </tr>"""
+
+    stuck_html = ""
+    if data["stuck_sessions"]:
+        stuck_items = "".join(
+            f'<li>{s["finding_id"]} ({s["class"]}) -- dispatched {s["dispatched_at"]}</li>'
+            for s in data["stuck_sessions"]
+        )
+        stuck_html = f'<div class="card alert"><h3>Stuck Sessions</h3><ul>{stuck_items}</ul></div>'
+    else:
+        stuck_html = '<div class="card ok"><h3>Stuck Sessions</h3><p>None detected (threshold: 30 min)</p></div>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remediation Dashboard</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background: #0d1117; color: #c9d1d9; line-height: 1.5; padding: 24px; }}
+  h1 {{ color: #f0f6fc; margin-bottom: 4px; font-size: 1.6rem; }}
+  h2 {{ color: #8b949e; font-size: 0.85rem; font-weight: 400; margin-bottom: 24px; }}
+  h3 {{ color: #f0f6fc; font-size: 1rem; margin-bottom: 12px; }}
+  a {{ color: #58a6ff; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  code {{ background: #161b22; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }}
+
+  .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }}
+  .stat {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; text-align: center; }}
+  .stat .num {{ font-size: 2rem; font-weight: 700; }}
+  .stat .label {{ font-size: 0.8rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }}
+  .stat.success .num {{ color: #3fb950; }}
+  .stat.failed .num {{ color: #f85149; }}
+  .stat.running .num {{ color: #d29922; }}
+  .stat.total .num {{ color: #58a6ff; }}
+
+  .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin-bottom: 24px; }}
+  .card.alert {{ border-color: #f85149; }}
+  .card.ok {{ border-color: #3fb950; }}
+
+  table {{ width: 100%; border-collapse: collapse; }}
+  th {{ text-align: left; color: #8b949e; font-size: 0.75rem; text-transform: uppercase;
+       letter-spacing: 0.05em; padding: 8px 12px; border-bottom: 1px solid #30363d; }}
+  td {{ padding: 10px 12px; border-bottom: 1px solid #21262d; font-size: 0.9rem; }}
+  tr:hover {{ background: #1c2128; }}
+
+  .success {{ color: #3fb950; }}
+  .failed {{ color: #f85149; }}
+  .running {{ color: #d29922; }}
+
+  .badge {{ display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.75rem;
+           font-weight: 600; }}
+  .badge-cve {{ background: #f8514922; color: #f85149; }}
+  .badge-broad-catch {{ background: #d2992222; color: #d29922; }}
+  .badge-any-type {{ background: #58a6ff22; color: #58a6ff; }}
+  .badge-describe-to-test {{ background: #3fb95022; color: #3fb950; }}
+  .badge-exhaustive-deps {{ background: #bc8cff22; color: #bc8cff; }}
+
+  .bar-bg {{ display: inline-block; width: 100px; height: 8px; background: #21262d;
+            border-radius: 4px; vertical-align: middle; margin-right: 8px; }}
+  .bar-fill {{ height: 100%; background: #3fb950; border-radius: 4px; transition: width 0.3s; }}
+  .rate {{ font-size: 0.85rem; color: #8b949e; }}
+
+  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
+  @media (max-width: 800px) {{ .grid {{ grid-template-columns: 1fr; }} .stats {{ grid-template-columns: repeat(2, 1fr); }} }}
+
+  .footer {{ margin-top: 32px; text-align: center; color: #484f58; font-size: 0.8rem; }}
+</style>
+</head>
+<body>
+  <h1>Remediation Dashboard</h1>
+  <h2>Event-driven code quality automation -- jjejones31/superset</h2>
+
+  <div class="stats">
+    <div class="stat total"><div class="num">{s['total']}</div><div class="label">Total</div></div>
+    <div class="stat success"><div class="num">{s['success']}</div><div class="label">Success</div></div>
+    <div class="stat running"><div class="num">{s['running']}</div><div class="label">Running</div></div>
+    <div class="stat failed"><div class="num">{s['failed']}</div><div class="label">Failed</div></div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>By Class</h3>
+      <table>
+        <thead><tr><th>Class</th><th>Total</th><th>OK</th><th>Active</th><th>Fail</th><th>Rate</th></tr></thead>
+        <tbody>{class_rows}</tbody>
+      </table>
+    </div>
+    {stuck_html}
+  </div>
+
+  <div class="card">
+    <h3>All Sessions</h3>
+    <table>
+      <thead><tr><th>Issue</th><th>Class</th><th>Finding</th><th>Outcome</th><th>PR</th></tr></thead>
+      <tbody>{session_rows}</tbody>
+    </table>
+  </div>
+
+  <div class="footer">
+    Success rate: {success_rate}% | Last refresh: {data['timestamp'][:19]}Z |
+    <a href="/dashboard/json">JSON</a> |
+    <a href="/dashboard/text">Plain text</a>
+  </div>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html"}
+
+
+@app.route("/dashboard/json", methods=["GET"])
+def dashboard_json():
+    """JSON dashboard API."""
+    return jsonify(_get_dashboard_data())
 
 
 @app.route("/dashboard/text", methods=["GET"])
