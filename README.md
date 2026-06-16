@@ -21,8 +21,8 @@ This system scans a Superset fork for batch-automatable issues across 5 categori
 ```
 ┌──────────────┐     ┌─────────────┐     ┌──────────────┐
 │ GitHub Event │────▶│  Webhook    │────▶│  Dispatcher  │
-│ (issue.labeled)   │  Server     │     │  (prompt     │
-│               │     │             │     │   builder)   │
+│ (push, PR,   │     │  Server     │     │  (prompt     │
+│  issue.label)│     │             │     │   builder)   │
 └──────────────┘     └─────────────┘     └──────┬───────┘
                                                 │
                      ┌─────────────┐            │ Devin API
@@ -45,12 +45,40 @@ Scan results ───────▶│  Scanners   │     ┌─────�
 
 ### Event-Driven Flow
 
-1. **Scan trigger** (`POST /scan`) → scanners run against the codebase → findings emitted
-2. **Issue creation** → each finding becomes a GitHub issue with provenance, playbook, and acceptance criteria
-3. **Label event** → when `auto-remediation` label is applied, webhook fires
-4. **Session dispatch** → Devin session created with structured prompt (playbook + reference PR from prior successes)
-5. **Monitoring** → real-time dashboard tracks active sessions, stuck detection, failure taxonomy
-6. **Completion** → PR merged → dossier filed → knowledge distilled for next batch
+The system responds to multiple GitHub events — the primary trigger is a **push to main**:
+
+1. **Push to `main`** → webhook receives `push` event → scanners run against changed files → new findings become issues → Devin sessions auto-dispatch
+2. **PR opened targeting `main`** → webhook receives `pull_request.opened` → scan runs → new issues created (sessions dispatch after merge)
+3. **Issue labeled** → when `auto-remediation` label is applied, webhook fires → session dispatched
+4. **PR merged** → dossier updated → knowledge distilled for next batch
+5. **Manual trigger** → `POST /scan` or `POST /dispatch` for on-demand runs
+
+#### Push-to-Main Flow (Primary)
+```
+git push origin main
+    │
+    ▼
+GitHub sends push event to /webhook
+    │
+    ▼
+handle_push() inspects changed files:
+  *.py changed?     → run broad-catch scanner
+  *.ts/*.tsx?        → run any-type + exhaustive-deps scanners
+  *test*/*spec*?     → run describe-to-test scanner
+  requirements.txt?  → run CVE scanner
+    │
+    ▼
+New findings deduped against existing issues (content-addressed IDs)
+    │
+    ▼
+New issues created via gh CLI (with provenance + playbook)
+    │
+    ▼
+Devin sessions auto-dispatched (tagged: push-triggered)
+    │
+    ▼
+Monitor tracks: status, stuck detection, failure taxonomy
+```
 
 ### Key Design Decisions
 
@@ -84,7 +112,7 @@ docker compose up --build
 #    URL: https://your-server/webhook
 #    Content type: application/json
 #    Secret: (same as GITHUB_WEBHOOK_SECRET)
-#    Events: Issues, Pull requests
+#    Events: Pushes, Issues, Pull requests
 ```
 
 ### Manual API Usage

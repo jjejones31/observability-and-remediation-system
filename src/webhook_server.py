@@ -2,9 +2,11 @@
 Event-driven webhook server for the remediation system.
 
 Listens for GitHub webhook events and triggers remediation sessions:
-  1. issues.labeled — when an issue gets the `auto-remediation` label, dispatch a Devin session
-  2. pull_request.closed — when a PR is merged, update dossier and close the issue
-  3. Manual /scan endpoint — trigger a full scan + issue creation + dispatch cycle
+  1. push to default branch    -- scan changed files, create new issues, auto-dispatch
+  2. pull_request to main      -- scan PR diff for new issues before merge
+  3. issues.labeled            -- when an issue gets `auto-remediation` label, dispatch
+  4. pull_request.closed       -- when a PR is merged, update dossier and close the issue
+  5. Manual /scan endpoint     -- trigger a full scan + issue creation + dispatch cycle
 
 Usage:
     python webhook_server.py              # Start server on port 8080
@@ -18,6 +20,7 @@ import hmac
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -41,7 +44,7 @@ from monitor import (
     render_status_dashboard, render_failure_taxonomy,
     render_stuck_sessions, render_learning_curve,
 )
-from create_issues_gh import extract_provenance
+from create_issues_gh import extract_provenance, run as create_issues_run, existing_finding_ids
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("webhook")
@@ -55,7 +58,7 @@ REPO = os.environ.get("GITHUB_REPO", "jjejones31/superset")
 SIMULATE = False
 
 
-# ─── Devin API client ───────────────────────────────────────────────────────
+# --- Devin API client -------------------------------------------------------
 
 def devin_create_session(prompt: str, title: str, tags: list[str]) -> dict | None:
     """Create a Devin session via the REST API."""
@@ -63,11 +66,11 @@ def devin_create_session(prompt: str, title: str, tags: list[str]) -> dict | Non
 
     if SIMULATE:
         sim_id = hashlib.sha1(title.encode()).hexdigest()[:16]
-        log.info(f"[SIMULATE] Would create session: {title} → sim-{sim_id}")
+        log.info(f"[SIMULATE] Would create session: {title} -> sim-{sim_id}")
         return {"session_id": f"sim-{sim_id}", "url": f"https://app.devin.ai/sessions/sim-{sim_id}"}
 
     if not DEVIN_API_KEY:
-        log.error("DEVIN_API_KEY not set — cannot create sessions")
+        log.error("DEVIN_API_KEY not set -- cannot create sessions")
         return None
 
     resp = requests.post(
@@ -81,7 +84,7 @@ def devin_create_session(prompt: str, title: str, tags: list[str]) -> dict | Non
         return None
 
     data = resp.json()
-    log.info(f"Session created: {data.get('session_id')} → {data.get('url')}")
+    log.info(f"Session created: {data.get('session_id')} -> {data.get('url')}")
     return data
 
 
@@ -105,7 +108,7 @@ def devin_get_session(session_id: str) -> dict | None:
     return resp.json()
 
 
-# ─── Webhook handlers ───────────────────────────────────────────────────────
+# --- Webhook handlers -------------------------------------------------------
 
 def verify_github_signature(payload: bytes, signature: str) -> bool:
     """Verify GitHub webhook HMAC signature."""
@@ -117,8 +120,259 @@ def verify_github_signature(payload: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
+# --- Push handler (new commit / PR merge to main) ---------------------------
+
+def handle_push(payload: dict) -> dict:
+    """Handle push to default branch -- scan repo, create new issues, dispatch sessions."""
+    ref = payload.get("ref", "")
+    default_branch = payload.get("repository", {}).get("default_branch", "main")
+
+    if ref != f"refs/heads/{default_branch}":
+        return {"action": "ignored", "reason": f"push to {ref}, not default branch"}
+
+    commits = payload.get("commits", [])
+    if not commits:
+        return {"action": "ignored", "reason": "no commits in push"}
+
+    # Collect changed files from all commits in this push
+    changed_files: set[str] = set()
+    for commit in commits:
+        changed_files.update(commit.get("added", []))
+        changed_files.update(commit.get("modified", []))
+
+    log.info(f"Push to {default_branch}: {len(commits)} commits, {len(changed_files)} files changed")
+    log.info(f"  Pusher: {payload.get('pusher', {}).get('name', 'unknown')}")
+    log.info(f"  Head: {payload.get('after', '')[:12]}")
+
+    # Run targeted scan based on changed file types
+    from scanners import (
+        scan_cve, scan_broad_catch, scan_exhaustive_deps,
+        scan_any_type, scan_describe_to_test,
+    )
+
+    findings: list[Finding] = []
+
+    py_files = [f for f in changed_files if f.endswith(".py")]
+    ts_files = [f for f in changed_files if f.endswith((".ts", ".tsx"))]
+    dep_files = [f for f in changed_files if f in (
+        "requirements.txt", "setup.py", "setup.cfg", "pyproject.toml",
+        "package.json", "package-lock.json", "yarn.lock",
+    )]
+    test_files = [f for f in changed_files if "test" in f.lower() or "spec" in f.lower()]
+
+    if dep_files:
+        log.info("  Dependency files changed -- running CVE scanner")
+        findings.extend(scan_cve())
+
+    if py_files:
+        log.info(f"  {len(py_files)} Python files changed -- running broad-catch scanner")
+        findings.extend(scan_broad_catch())
+
+    if ts_files:
+        log.info(f"  {len(ts_files)} TS/TSX files changed -- running any-type + exhaustive-deps scanners")
+        findings.extend(scan_any_type())
+        findings.extend(scan_exhaustive_deps())
+
+    if test_files:
+        log.info(f"  {len(test_files)} test files changed -- running describe-to-test scanner")
+        findings.extend(scan_describe_to_test())
+
+    # If nothing matched specific scanners but files were changed, run full scan
+    if not findings and changed_files:
+        log.info("  No targeted scanner matched -- running full scan")
+        findings.extend(scan_cve())
+        findings.extend(scan_broad_catch())
+        findings.extend(scan_exhaustive_deps())
+        findings.extend(scan_any_type())
+        findings.extend(scan_describe_to_test())
+
+    if not findings:
+        return {"action": "scan_complete", "new_findings": 0, "sessions_dispatched": 0}
+
+    # Deduplicate against existing issues
+    existing_ids = existing_finding_ids()
+    new_findings = [f for f in findings if f.finding_id not in existing_ids]
+
+    log.info(f"  Scan found {len(findings)} total, {len(new_findings)} new findings")
+
+    # Create issues for new findings
+    if new_findings:
+        create_issues_run(new_findings, dry_run=SIMULATE)
+
+    # Auto-dispatch sessions for new findings
+    sessions_created = []
+    state = DispatchState.load()
+    for finding in new_findings:
+        if state.is_dispatched(finding.finding_id):
+            continue
+
+        cls_name = finding.cls.value if isinstance(finding.cls, RemediationClass) else str(finding.cls)
+        issue_number = _find_issue_number(finding.finding_id)
+        prompt = _build_prompt_for_finding(finding, issue_number)
+        tags = [
+            f"remediation:{cls_name}",
+            f"finding:{finding.finding_id}",
+            "auto-remediation",
+            "push-triggered",
+        ]
+        if issue_number:
+            tags.append(f"issue:{issue_number}")
+
+        result = devin_create_session(
+            prompt,
+            f"[auto] {finding.finding_id} {cls_name}: {finding.title[:60]}",
+            tags,
+        )
+        if result:
+            state.record_dispatch(
+                finding.finding_id, result["session_id"],
+                issue_number or 0, cls_name,
+            )
+            sessions_created.append({
+                "finding_id": finding.finding_id,
+                "session_id": result["session_id"],
+                "class": cls_name,
+            })
+
+    log.info(f"  Dispatched {len(sessions_created)} sessions")
+
+    return {
+        "action": "push_processed",
+        "ref": ref,
+        "commits": len(commits),
+        "files_changed": len(changed_files),
+        "findings_total": len(findings),
+        "findings_new": len(new_findings),
+        "sessions_dispatched": len(sessions_created),
+        "sessions": sessions_created,
+    }
+
+
+# --- PR opened handler (scan before merge) ----------------------------------
+
+def handle_pr_opened(payload: dict) -> dict:
+    """Handle pull_request opened/synchronize -- scan PR diff, post findings as comments."""
+    pr = payload.get("pull_request", {})
+    base_ref = pr.get("base", {}).get("ref", "")
+    default_branch = payload.get("repository", {}).get("default_branch", "main")
+
+    if base_ref != default_branch:
+        return {"action": "ignored", "reason": f"PR targets {base_ref}, not {default_branch}"}
+
+    pr_number = pr.get("number", 0)
+    pr_title = pr.get("title", "")
+    log.info(f"PR #{pr_number} ({pr_title}) targeting {default_branch} -- scanning")
+
+    # Run full scan to find any issues the PR might introduce or fix
+    from scanners import (
+        scan_cve, scan_broad_catch, scan_exhaustive_deps,
+        scan_any_type, scan_describe_to_test,
+    )
+
+    findings: list[Finding] = []
+    findings.extend(scan_cve())
+    findings.extend(scan_broad_catch())
+    findings.extend(scan_exhaustive_deps())
+    findings.extend(scan_any_type())
+    findings.extend(scan_describe_to_test())
+
+    existing_ids = existing_finding_ids()
+    new_findings = [f for f in findings if f.finding_id not in existing_ids]
+
+    log.info(f"  PR scan: {len(findings)} total, {len(new_findings)} new")
+
+    # Create issues for new findings (but don't auto-dispatch -- let the PR merge first)
+    if new_findings:
+        create_issues_run(new_findings, dry_run=SIMULATE)
+
+    return {
+        "action": "pr_scanned",
+        "pr_number": pr_number,
+        "findings_total": len(findings),
+        "findings_new": len(new_findings),
+        "note": "New issues created; sessions will dispatch on push to main after merge",
+    }
+
+
+# --- Helpers for push-triggered dispatch ------------------------------------
+
+def _find_issue_number(finding_id: str) -> int | None:
+    """Look up the GitHub issue number for a finding_id via gh CLI."""
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "list", "--repo", REPO, "--label", "auto-remediation",
+             "--json", "number,body", "--limit", "200"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return None
+        issues = json.loads(result.stdout)
+        for issue in issues:
+            prov = extract_provenance(issue.get("body", ""))
+            if prov and prov.get("finding_id") == finding_id:
+                return issue["number"]
+    except Exception:
+        pass
+    return None
+
+
+def _build_prompt_for_finding(finding: Finding, issue_number: int | None) -> str:
+    """Build an agent prompt for a finding (used by push-triggered dispatch)."""
+    cls_name = finding.cls.value if isinstance(finding.cls, RemediationClass) else str(finding.cls)
+    try:
+        rc = RemediationClass(cls_name)
+    except ValueError:
+        rc = None
+
+    playbook = PLAYBOOKS.get(rc, {}) if rc else {}
+    ref_pr = REFERENCE_PRS.get(cls_name, {})
+
+    lines = [
+        f"# Remediation: {finding.title}",
+        f"Finding ID: {finding.finding_id}",
+        f"Class: {cls_name}",
+    ]
+    if finding.file_path:
+        lines.append(f"File: {finding.file_path}")
+    lines.append(f"Severity: {finding.severity}")
+    lines.append("")
+
+    if finding.detail:
+        lines.append(f"## Detail\n{finding.detail}")
+        lines.append("")
+
+    if issue_number:
+        lines.append(f"GitHub Issue: https://github.com/{REPO}/issues/{issue_number}")
+        lines.append("")
+
+    if playbook:
+        lines.append("## Playbook")
+        lines.append(f"**Objective:** {playbook.get('objective', '')}")
+        for i, step in enumerate(playbook.get("steps", []), 1):
+            lines.append(f"{i}. {step}")
+        lines.append("")
+        lines.append("## Acceptance Criteria")
+        for ac in playbook.get("acceptance", []):
+            lines.append(f"- {ac}")
+        lines.append("")
+        lines.append(f"## Verify\n```bash\n{playbook.get('verify', '')}\n```")
+
+    if ref_pr:
+        lines.append("\n## Reference: Completed PR for this class")
+        lines.append(f"- PR: {ref_pr.get('pr_url', '')}")
+        lines.append(f"- Summary: {ref_pr.get('summary', '')}")
+        if ref_pr.get("learnings"):
+            lines.append("- Key learnings:")
+            for learning in ref_pr["learnings"]:
+                lines.append(f"  - {learning}")
+
+    return "\n".join(lines)
+
+
+# --- Issue labeled handler ---------------------------------------------------
+
 def handle_issue_labeled(payload: dict) -> dict:
-    """Handle issues.labeled event — dispatch remediation session."""
+    """Handle issues.labeled event -- dispatch remediation session."""
     issue_data = payload.get("issue", {})
     label = payload.get("label", {}).get("name", "")
 
@@ -142,7 +396,7 @@ def handle_issue_labeled(payload: dict) -> dict:
                 "session_id": existing.get("session_id")}
 
     # Build the Issue object
-    label_names = [l["name"] for l in issue_data.get("labels", [])]
+    label_names = [lbl["name"] for lbl in issue_data.get("labels", [])]
     issue = Issue(
         number=issue_data["number"],
         title=issue_data["title"],
@@ -199,8 +453,10 @@ def handle_issue_labeled(payload: dict) -> dict:
     }
 
 
+# --- PR merged handler -------------------------------------------------------
+
 def handle_pr_merged(payload: dict) -> dict:
-    """Handle pull_request.closed (merged) — update dossier, close issue."""
+    """Handle pull_request.closed (merged) -- update dossier, close issue."""
     pr = payload.get("pull_request", {})
     if not pr.get("merged"):
         return {"action": "ignored", "reason": "PR closed but not merged"}
@@ -234,7 +490,7 @@ def handle_pr_merged(payload: dict) -> dict:
     return {"action": "completed", "finding_id": matched_finding, "pr_url": pr_url}
 
 
-# ─── Routes ─────────────────────────────────────────────────────────────────
+# --- Routes ------------------------------------------------------------------
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -251,10 +507,14 @@ def webhook():
 
     log.info(f"Webhook received: {event}.{action}")
 
-    if event == "issues" and action == "labeled":
-        result = handle_issue_labeled(payload)
+    if event == "push":
+        result = handle_push(payload)
+    elif event == "pull_request" and action in ("opened", "synchronize"):
+        result = handle_pr_opened(payload)
     elif event == "pull_request" and action == "closed":
         result = handle_pr_merged(payload)
+    elif event == "issues" and action == "labeled":
+        result = handle_issue_labeled(payload)
     else:
         result = {"action": "ignored", "reason": f"unhandled event: {event}.{action}"}
 
@@ -265,10 +525,9 @@ def webhook():
 def scan_and_dispatch():
     """
     Manual trigger: run scanners, create issues, and dispatch sessions.
-    This simulates: scan results → issue creation → session dispatch.
+    This simulates: scan results -> issue creation -> session dispatch.
     """
     from scanners import scan_cve, scan_broad_catch, scan_exhaustive_deps, scan_any_type, scan_describe_to_test
-    from create_issues_gh import run as create_issues_run
 
     log.info("Manual scan triggered")
 
@@ -409,7 +668,7 @@ def health():
     })
 
 
-# ─── Main ───────────────────────────────────────────────────────────────────
+# --- Main --------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Remediation Webhook Server")
@@ -427,12 +686,13 @@ def main():
     log.info(f"  Target repo: {REPO}")
     log.info("")
     log.info("Endpoints:")
-    log.info(f"  POST /webhook          — GitHub webhook receiver")
-    log.info(f"  POST /scan             — Trigger scan + issue creation")
-    log.info(f"  POST /dispatch         — Dispatch sessions for open issues")
-    log.info(f"  GET  /dashboard        — JSON observability dashboard")
-    log.info(f"  GET  /dashboard/text   — Text dashboard (terminal-friendly)")
-    log.info(f"  GET  /health           — Health check")
+    log.info("  POST /webhook          -- GitHub webhook receiver")
+    log.info("    Events: push (scan+dispatch), pull_request (scan/merge), issues.labeled (dispatch)")
+    log.info("  POST /scan             -- Trigger scan + issue creation")
+    log.info("  POST /dispatch         -- Dispatch sessions for open issues")
+    log.info("  GET  /dashboard        -- JSON observability dashboard")
+    log.info("  GET  /dashboard/text   -- Text dashboard (terminal-friendly)")
+    log.info("  GET  /health           -- Health check")
 
     app.run(host="0.0.0.0", port=args.port, debug=False)
 
