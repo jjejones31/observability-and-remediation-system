@@ -127,8 +127,11 @@ curl -X POST http://localhost:8080/dispatch
 # Dispatch hero issues only
 curl -X POST "http://localhost:8080/dispatch?heroes_only=true&concurrency=3"
 
-# View dashboard (JSON)
-curl http://localhost:8080/dashboard
+# View dashboard (styled HTML — open in browser)
+open http://localhost:8080/dashboard
+
+# View dashboard (JSON API)
+curl http://localhost:8080/dashboard/json
 
 # View dashboard (terminal-friendly text)
 curl http://localhost:8080/dashboard/text
@@ -142,10 +145,14 @@ curl http://localhost:8080/health
 The system answers: "If I were an engineering leader, how would I know this is working?"
 
 ### Dashboard (`GET /dashboard`)
-- **Summary**: total dispatched, running, success, failed counts
-- **Per-class breakdown**: success rate, ACU cost per class
-- **Stuck detection**: sessions running >30min with no PR flagged for intervention
-- **Reference PRs**: which classes have proven methods from prior completions
+
+Open `http://localhost:8080/dashboard` in a browser to see the styled HTML dashboard:
+
+- **Summary cards**: total dispatched, running, success, failed — color-coded at a glance
+- **Per-class breakdown table**: success rate with progress bars for each remediation category
+- **Stuck detection panel**: sessions running >30min with no PR flagged for intervention
+- **All Sessions table**: every dispatched session with links to GitHub issues and PRs
+- **Footer links**: switch between HTML, JSON (`/dashboard/json`), and plain text (`/dashboard/text`) views
 
 ### Monitor CLI
 ```bash
@@ -171,7 +178,18 @@ Sessions are classified into 9 failure categories with actionable recommendation
 
 ## Results
 
-### Test Runs Completed
+**8 sessions dispatched → 8 PRs → 100% success rate**
+
+### Hero PRs (complex, non-trivial remediations)
+| Issue | Class | PR | Method |
+|-------|-------|-----|--------|
+| #1 | cve | [#65](https://github.com/jjejones31/superset/pull/65) | Flask 2.3.3 → 3.1.3, cascading through 12 Flask extensions |
+| #6 | broad-catch | [#68](https://github.com/jjejones31/superset/pull/68) | Narrowed to `(DBAPIError, KeyError)` across 30+ DB engines, 3 unit tests |
+| #26 | any-type | [#69](https://github.com/jjejones31/superset/pull/69) | Replaced all 16 `any` types in MetricsControl with precise types |
+| #46 | describe-to-test | [#66](https://github.com/jjejones31/superset/pull/66) | Removed 4 `describe()` wrappers, 12 tests flattened |
+| #61 | exhaustive-deps | [#67](https://github.com/jjejones31/superset/pull/67) | `useRef` pattern for `refreshHandler` — fixes stale closure without infinite loops |
+
+### Test Runs (simpler variants, used as references for heroes)
 | Issue | Class | PR | Method |
 |-------|-------|-----|--------|
 | #60 | describe-to-test | [#63](https://github.com/jjejones31/superset/pull/63) | Removed `describe()`, prefixed test names, dedented to flat |
